@@ -2,7 +2,10 @@ from __future__ import absolute_import
 
 import argparse
 import logging
-import re
+import json
+
+from os import listdir
+from os.path import isfile, join
 
 from past.builtins import unicode
 
@@ -12,31 +15,9 @@ from apache_beam.io import WriteToText
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import SetupOptions
 
-class EstadosExtractingDoFn(beam.DoFn):
-  """Parse each line of input text into words."""
-  def process(self, element):
-    """Returns an iterator over the words of this element.
-
-    The element is a line of text.  If the line is blank, note that, too.
-
-    Args:
-      element: the element being processed
-
-    Returns:
-      The processed element.
-    """
-    info = []
-    count = 0
-    for item in element.split(";"):
-      if count == 0: #Nome do estado
-        info.append(item)
-      elif count == 3: #Nome do governador
-        info.append(item)
-      count += 1    
-    return info
-
 class CasosSplitDoFn(beam.DoFn):
   def process(self, element):
+    # Extrai as infos necessarias do csv de casos
     regiao = element.split(';')[0]  
     uf = element.split(';')[1]
     cod = element.split(';')[3]
@@ -51,18 +32,17 @@ class CasosSplitDoFn(beam.DoFn):
 
 class CasosToTupleDoFn(beam.DoFn):
   def process(self, element):  
-    # Returns a list of tuples containing Date and Open value
-        result = [(element['regiao_uf_cod'], (element['casos_novos'], element['obitos_novos']))]
-        print(result)
-        return result
+      # Retorna o dicionario no formato de tupla
+      result = [(element['regiao_uf_cod'], (element['casos_novos'], element['obitos_novos']))]
+      return result
 
 def run(argv=None, save_main_session=True):
-  """Main entry point; defines and runs the wordcount pipeline."""
+  """Main entry point"""
   parser = argparse.ArgumentParser()
   parser.add_argument(
       '--input',
       dest='input',
-      default='gs://dataflow-samples/shakespeare/kinglear.txt',
+      required=True,
       help='Input file to process.')
   parser.add_argument(
       '--output',
@@ -70,49 +50,54 @@ def run(argv=None, save_main_session=True):
       required=True,
       help='Output file to write results to.')
   known_args, pipeline_args = parser.parse_known_args(argv)
-
-  # We use the save_main_session option because one or more DoFn's in this
-  # workflow rely on global context (e.g., a module imported at module level).
   pipeline_options = PipelineOptions(pipeline_args)
   pipeline_options.view_as(SetupOptions).save_main_session = save_main_session
 
-  #limpa csv do covid pois como estamos somando por estado, nao precisamos das infos por municipio
+  #limpa csv do covid pois como estamos somando por estado, nao precisamos das infos por municipio nem por pais
   with open(known_args.input + "/HIST_PAINEL_COVIDBR_28set2020.csv", 'r') as infile, open(known_args.input + "/HIST_PAINEL_COVIDBR_28set2020_clean.csv", 'w') as outfile:
         count = 1
         for line in infile:
-            if count == 1 or count <= 6077:
+            if count >= 219 and count <= 6077:
                 outfile.write(line)
             count += 1
 
   # The pipeline will be run on exiting the with block.
   with beam.Pipeline(options=pipeline_options) as p:
 
-    # Read the text file[pattern] into a PCollection.
-    estados = p | 'Read_estados' >> ReadFromText(known_args.input + "/EstadosIBGE.csv")
-    casos = p  | 'Read_casos' >> ReadFromText(known_args.input + "/HIST_PAINEL_COVIDBR_28set2020_clean.csv",skip_header_lines=1)
+    # Carrega os casos numa PCollection.
+    casos = p  | 'Read Casos' >> ReadFromText(known_args.input + "HIST_PAINEL_COVIDBR_28set2020_clean.csv",skip_header_lines=1)
     
+    # Agregador customizado para somar tanto os casos quanto os obitos
     def multi_sum(element):
       (key, values) = element
+      #transposta para aplicar o sum
       values_t = list(zip(*values))
       return (key, (sum(values_t[0]), sum(values_t[1])))
 
+    # Obtem as contagens
     counts = ( 
       casos
       | 'SplitToDict' >> beam.ParDo(CasosSplitDoFn())
       | 'DictToTuple' >> beam.ParDo(CasosToTupleDoFn())
-      | 'group' >> beam.GroupByKey()
-      | 'count' >> beam.Map(multi_sum))
-      #| 'GroupAndSum' >> beam.CombinePerKey(sum))           
-    
-    #counts = (
-    #    lines
-    #    | 'Split' >>
-    #    (beam.ParDo(EstadosExtractingDoFn()).with_output_types(unicode))
-    #    | 'PairWIthOne' >> beam.Map(lambda x: (x, 1))
-    #    | 'GroupAndSum' >> beam.CombinePerKey(sum))
-    
-    # Format the counts into a PCollection of strings.
-    def format_result(regiao_uf_cod, count):
+      | 'Group' >> beam.GroupByKey()
+      | 'Count' >> beam.Map(multi_sum))
+     
+    # Formata os resultados obtidos conforme pedido para o csv
+    def format_result_csv(regiao_uf_cod, count):
+      nome = ""
+      governador = ""
+      regiao = regiao_uf_cod.split(';')[0]  
+      uf = regiao_uf_cod.split(';')[1]
+      cod = regiao_uf_cod.split(';')[2]
+      with open(known_args.input + "EstadosIBGE.csv", 'r') as infile:
+        for line in infile:
+          if cod == line.split(";")[1]:
+            nome = line.split(";")[0]
+            governador = line.split(";")[3]
+      return '%s,%s,%s,%s,%d,%d' % (regiao, nome, uf, governador, count[0], count[1])
+
+    # Formata os resultados obtidos conforme pedido para o JSON
+    def format_result_json(regiao_uf_cod, count):
       nome = ""
       governador = ""
       regiao = regiao_uf_cod.split(';')[0]  
@@ -120,20 +105,50 @@ def run(argv=None, save_main_session=True):
       cod = regiao_uf_cod.split(';')[2]
       with open(known_args.input + "/EstadosIBGE.csv", 'r') as infile:
         for line in infile:
-          print(cod)
-          print(line.split(";")[1])
           if cod == line.split(";")[1]:
             nome = line.split(";")[0]
             governador = line.split(";")[3]
-      return '%s,%s,%s,%s,%d,%d' % (regiao, nome, uf, governador, count[0], count[1])
+      dict_j = {"Regiao":regiao,
+              "Estado":nome,
+              "UF":uf,
+              "Governador":governador,
+              "TotalCasos":count[0],
+              "TotalObitos":count[1]}
+      return json.dumps(dict_j, ensure_ascii=False)
 
-    output = counts | 'Format' >> beam.MapTuple(format_result)
+    output_csv = counts | 'FormatCSV' >> beam.MapTuple(format_result_csv)
+    output_json = counts | 'FormatJSON' >> beam.MapTuple(format_result_json)
+    
+    output_csv | 'WriteCSV' >> WriteToText(known_args.output,file_name_suffix='.csv')
+    output_json | 'WriteJSON' >> WriteToText(known_args.output,file_name_suffix='.json')
 
-    # Write the output using a "Write" transform that has side effects.
-    # pylint: disable=expression-not-assigned
-    output | 'WriteCSV' >> WriteToText(known_args.output)
-
-    output | 'WriteJSON' >> WriteToText(known_args.output)
+  #gera lista de arquivos no diretorio para consolidar
+  onlyfiles = [f for f in listdir(known_args.output) if isfile(join(known_args.output, f))]
+  with open(known_args.output + "CONSOLIDADO.csv", 'w') as csv_file, open(known_args.output + "CONSOLIDADO.json", 'w') as json_file:
+    #headers
+    csv_file.write('Regiao,Estado,UF,Governador,TotalCasos,TotalObitos')
+    json_file.write('[')
+    output_files = [f for f in listdir(known_args.output) if isfile(join(known_args.output, f))]
+    csv_files = [x for x in output_files if ".csv" in x]
+    json_files = [x for x in output_files if ".json" in x]
+    #para encontrar o ultimo json e fechar a lista
+    count_files = 1
+    for file_name in csv_files:
+      with open(known_args.output + file_name, 'r') as part:
+        for line in part:
+          csv_file.write(line)          
+    for file_name in json_files:
+      with open(known_args.output + file_name, 'r') as part:
+        count_lines = 1
+        lines = part.readlines()
+        for line in lines:
+          if count_files == len(json_files) and count_lines == len(lines):
+            json_file.write(line + ']')
+            count_lines += 1
+          else:
+            json_file.write(line + ',')  
+            count_lines += 1
+      count_files += 1        
 
 
 if __name__ == '__main__':
