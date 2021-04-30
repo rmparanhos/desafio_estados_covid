@@ -65,7 +65,7 @@ def run(argv=None, save_main_session=True):
   with beam.Pipeline(options=pipeline_options) as p:
 
     # Carrega os casos numa PCollection.
-    casos = p  | 'Read Casos' >> ReadFromText(known_args.input + "HIST_PAINEL_COVIDBR_28set2020_clean.csv",skip_header_lines=1)
+    casos = p  | 'Read Casos' >> ReadFromText(known_args.input + "HIST_PAINEL_COVIDBR_28set2020_clean.csv")
     
     # Agregador customizado para somar tanto os casos quanto os obitos
     def multi_sum(element):
@@ -126,7 +126,7 @@ def run(argv=None, save_main_session=True):
   onlyfiles = [f for f in listdir(known_args.output) if isfile(join(known_args.output, f))]
   with open(known_args.output + "CONSOLIDADO.csv", 'w') as csv_file, open(known_args.output + "CONSOLIDADO.json", 'w') as json_file:
     #headers
-    csv_file.write('Regiao,Estado,UF,Governador,TotalCasos,TotalObitos')
+    csv_file.write('Regiao,Estado,UF,Governador,TotalCasos,TotalObitos\n')
     json_file.write('[')
     output_files = [f for f in listdir(known_args.output) if isfile(join(known_args.output, f))]
     csv_files = [x for x in output_files if ".csv" in x]
